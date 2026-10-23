@@ -134,11 +134,15 @@ Rules:
    root cause. Use a single call unless the transcript shows independent facts that each need a different tool
    to confirm. Never add exploratory or nice-to-have calls. Never repeat a tool with identical arguments.
 5. Each diagnostic's evidence: 1-2 IDs taken from your evidence list (the lines motivating that call).
-6. Arguments must satisfy the tool's inputSchema and copy exact identifiers from the transcript verbatim
-   (service names, deployment/version ids, flag keys, regions, metric names, time windows). Do not invent or reformat.
+6. Arguments: include EVERY required property of the tool's inputSchema. Include an optional property ONLY if the
+   transcript states its exact value. Copy identifiers verbatim from the transcript or incident context (service,
+   dependency, release/deployment ids, flag keys, regions, metric names, time windows). For enum properties pick an
+   enum value. NEVER invent values: no made-up search queries, window sizes, flag names, release names or counts.
+   Choose the diagnostic tool whose description most directly verifies the chosen root cause.
 7. effect: exactly one tool with kind="effect" that remediates the root cause, with exact arguments.
-   Rollback: use the exact deployment/version the schema field asks for (faulty one vs known-good target - read the
-   field description). Feature disable: the exact flag key that caused the issue.
+   Pick the effect whose description fits the root cause. Every identifier in its arguments must appear verbatim in
+   the transcript. Rollback: the exact release/deployment the schema field asks for (faulty one vs known-good target -
+   read the field description). Feature disable: the exact flag key that caused the issue.
    If the service is ALREADY at its permitted/maximum scaling limit, never scale; page the owning team instead.
 8. pageEffect: if an effect tool pages/notifies an owner, give its exact arguments for paging this service's owner
    (used if diagnostics reveal the service is at its scaling limit); otherwise null.`;
@@ -243,7 +247,24 @@ function fitArgs(args, schema, inc) {
   return out;
 }
 
-function normalizePlan(raw, b, knownIds, secs) {
+/** Drop optional arguments whose value is not grounded in the transcript/incident (anti-hallucination). */
+function groundArgs(args, schema, hay) {
+  schema = isObj(schema) ? schema : {};
+  const req = new Set(asList(schema.required));
+  const props = isObj(schema.properties) ? schema.properties : {};
+  const out = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (req.has(k) || typeof v === "boolean" || v === null) { out[k] = v; continue; }
+    const p = isObj(props[k]) ? props[k] : {};
+    if (Array.isArray(p.enum) && p.enum.includes(v)) { out[k] = v; continue; }
+    if (typeof v === "string" && v.trim() && hay.toLowerCase().includes(v.trim().toLowerCase())) { out[k] = v; continue; }
+    if (typeof v === "number" && new RegExp(`(^|[^0-9.])${String(v).replace(".", "\\.")}([^0-9.]|$)`).test(hay)) { out[k] = v; continue; }
+    // otherwise: invented optional value -> drop
+  }
+  return out;
+}
+
+function normalizePlan(raw, b, knownIds, secs, transcript = "") {
   raw = isObj(raw) ? raw : {};
   const inc = b.incident, pol = b.policy;
   const cat = Object.fromEntries(b.toolCatalog.map((t) => [t.name, t]));
@@ -265,11 +286,12 @@ function normalizePlan(raw, b, knownIds, secs) {
   }
   for (const e of knownIds) { if (ev.length >= 2) break; if (!ev.includes(e)) ev.push(e); }
 
+  const hay = transcript + "\n" + JSON.stringify({ s: inc.service, i: inc.incidentId, t: inc.title });
   const clean = (a) => redactObj(a, secs);
   const diags = [], seen = new Set();
   for (const d of asList(raw.diagnostics)) {
     if (!isObj(d) || !diagTools.includes(d.toolName)) continue;
-    const args = clean(fitArgs(d.arguments, cat[d.toolName].inputSchema, inc));
+    const args = clean(groundArgs(fitArgs(d.arguments, cat[d.toolName].inputSchema, inc), cat[d.toolName].inputSchema, hay));
     const key = d.toolName + canon(args);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -283,7 +305,7 @@ function normalizePlan(raw, b, knownIds, secs) {
   }
 
   const pick = (e) => (isObj(e) && effectTools.includes(e.toolName)
-    ? { toolName: e.toolName, arguments: clean(fitArgs(e.arguments, cat[e.toolName].inputSchema, inc)) }
+    ? { toolName: e.toolName, arguments: clean(groundArgs(fitArgs(e.arguments, cat[e.toolName].inputSchema, inc), cat[e.toolName].inputSchema, hay)) }
     : null);
   let eff = pick(raw.effect);
   if (!eff && effectTools.length) {
@@ -619,6 +641,16 @@ export class IncidentRun {
         await this.ctx.storage.put(key, JSON.parse(await request.text()));
         return json({ ok: true });
       }
+      if (path === "/detail") {
+        const key = "d:" + String(Date.now()).padStart(15, "0") + ":" + hexid(4);
+        await this.ctx.storage.put(key, JSON.parse(await request.text()));
+        return json({ ok: true });
+      }
+      if (path === "/details") {
+        const limit = Math.min(20, parseInt(new URL(request.url).searchParams.get("limit") || "10", 10) || 10);
+        const m = await this.ctx.storage.list({ prefix: "d:", reverse: true, limit });
+        return json({ details: [...m.values()] });
+      }
       if (path === "/recent") {
         const limit = Math.min(200, parseInt(new URL(request.url).searchParams.get("limit") || "60", 10) || 60);
         const m = await this.ctx.storage.list({ prefix: "e:", reverse: true, limit });
@@ -671,7 +703,7 @@ export class IncidentRun {
     const plan0 = await planWithModel(this.env, buildMessages(b, transcript, secs));
     const raw = plan0.raw, model = plan0.model, modelErr = plan0.err;
     const tChatEnd = nowNs();
-    const plan = normalizePlan(raw, b, knownIds, secs);
+    const plan = normalizePlan(raw, b, knownIds, secs, transcript);
     for (const e of [plan.effect, plan.pageEffect]) if (e) e.digest = await sha(canon(e.arguments));
 
     const st = {
@@ -706,6 +738,17 @@ export class IncidentRun {
       dispatches: fresh.map((d) => ({ tool: d.toolName, args: d.arguments, evidence: d.evidence })),
       plannedEffect: plan.effect, pageEffect: plan.pageEffect,
     });
+    try {
+      const idx = this.env.RUNS.get(this.env.RUNS.idFromName(INDEX_NAME));
+      await idx.fetch("https://run/detail", { method: "POST", body: JSON.stringify({
+        t: new Date().toISOString(), runId: b.runId,
+        incident: { incidentId: inc.incidentId, title: inc.title, service: inc.service, severity: inc.severity,
+          allowedRootCauses: inc.allowedRootCauses },
+        policy: { maximumDiagnostics: pol.maximumDiagnostics, effectTools: pol.effectTools,
+          approvalRequiredFor: pol.approvalRequiredFor },
+        toolCatalog: b.toolCatalog, modelRaw: raw, transcript,
+      }) });
+    } catch { /* ignore */ }
     return json(resp);
   }
 
@@ -784,6 +827,10 @@ export default {
 
       if (path === "/" && (m === "GET" || m === "HEAD")) return json({ ok: true, profile: PROFILE });
 
+      if (path === "/v2/debug/details" && m === "GET") {
+        const stub = env.RUNS.get(env.RUNS.idFromName(INDEX_NAME));
+        return await stub.fetch("https://run/details" + url.search);
+      }
       if (path === "/v2/debug/recent" && m === "GET") {
         const stub = env.RUNS.get(env.RUNS.idFromName(INDEX_NAME));
         return await stub.fetch("https://run/recent" + url.search);
