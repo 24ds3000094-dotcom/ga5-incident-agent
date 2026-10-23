@@ -19,7 +19,7 @@ NOTE = "note-" + uuid.uuid4().hex
 def call(method, path, body=None, headers=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(BASE + path, data=data, method=method,
-                                 headers={"Content-Type": "application/json", **(headers or {})})
+                                 headers={"Content-Type": "application/json", "User-Agent": "ga5-test/1.0", **(headers or {})})
     t = time.time()
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
