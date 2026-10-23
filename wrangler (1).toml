@@ -1,0 +1,23 @@
+name = "ga5-incident-agent"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+# Free model fallback (used only when no API key secret is set)
+[ai]
+binding = "AI"
+
+# One Durable Object per runId. Class name reuses the one already registered
+# by the earlier deployment, so no migration is needed.
+[[durable_objects.bindings]]
+name = "RUNS"
+class_name = "IncidentRun"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["IncidentRun"]
+
+[vars]
+LLM_BASE_URL = "https://aipipe.org/openai/v1"
+LLM_MODEL = "gpt-4.1-mini"
+# The API key is a SECRET set in the dashboard, never here.

@@ -566,7 +566,7 @@ async function readJson(request) {
 
 // ------------------------------------------------------------------ Durable Object
 
-export class RunStore {
+export class IncidentRun {
   constructor(ctx, env) { this.ctx = ctx; this.env = env; this.queue = Promise.resolve(); }
 
   serial(fn) { const p = this.queue.then(fn, fn); this.queue = p.catch(() => {}); return p; }
