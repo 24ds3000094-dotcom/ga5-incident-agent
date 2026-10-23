@@ -12,8 +12,19 @@ binding = "AI"
 name = "RUNS"
 class_name = "RunStore"
 
+# Already applied by your earlier deployment (kept so Wrangler knows the history)
 [[migrations]]
-tag = "ga5-v1"
+tag = "v1"
+new_sqlite_classes = ["IncidentRun"]
+
+# Remove the old class from the previous attempt (its old data is discarded)
+[[migrations]]
+tag = "v2"
+deleted_classes = ["IncidentRun"]
+
+# Create the new storage class
+[[migrations]]
+tag = "v3"
 new_sqlite_classes = ["RunStore"]
 
 [vars]
