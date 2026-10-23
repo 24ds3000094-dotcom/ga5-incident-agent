@@ -8,6 +8,7 @@
  */
 
 const PROFILE = "ga5-incident-agent/v2";
+const INDEX_NAME = "__ga5_debug_index__";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -172,24 +173,42 @@ function extractJson(txt) {
   return null;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Returns {raw, model, err, attempts, detail}. Retries 429/5xx/timeouts inside one time budget. */
 async function planWithModel(env, msgs) {
   const model = env.LLM_MODEL || "gpt-4.1-mini";
   const base = (env.LLM_BASE_URL || "https://aipipe.org/openai/v1").replace(/\/+$/, "");
-  if (!env.LLM_API_KEY) return [null, model, "no_api_key"];
-  try {
-    const r = await fetch(`${base}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${env.LLM_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages: msgs, temperature: 0, response_format: { type: "json_object" } }),
-      signal: AbortSignal.timeout(parseInt(env.LLM_TIMEOUT_MS || "14000", 10)),
-    });
-    if (!r.ok) return [null, model, `http_${r.status}`];
-    const data = await r.json();
-    const raw = extractJson(data?.choices?.[0]?.message?.content);
-    return [raw, data?.model || model, isObj(raw) ? null : "bad_json"];
-  } catch (e) {
-    return [null, model, e?.name === "TimeoutError" ? "timeout" : "error"];
+  if (!env.LLM_API_KEY) return { raw: null, model, err: "no_api_key", attempts: 0, detail: "" };
+  const deadline = Date.now() + parseInt(env.LLM_TIMEOUT_MS || "14000", 10);
+  let err = "error", detail = "", attempts = 0;
+  while (attempts < 3) {
+    const remaining = deadline - Date.now();
+    if (remaining < 2500) break;
+    attempts++;
+    try {
+      const r = await fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.LLM_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model, messages: msgs, temperature: 0, response_format: { type: "json_object" } }),
+        signal: AbortSignal.timeout(remaining),
+      });
+      if (!r.ok) {
+        err = `http_${r.status}`;
+        detail = (await r.text().catch(() => "")).slice(0, 200);
+        if (r.status === 429 || r.status >= 500) { await sleep(500 * attempts); continue; }
+        break;
+      }
+      const data = await r.json();
+      const raw = extractJson(data?.choices?.[0]?.message?.content);
+      if (isObj(raw)) return { raw, model: data?.model || model, err: null, attempts, detail: "" };
+      err = "bad_json";
+    } catch (e) {
+      err = e?.name === "TimeoutError" ? "timeout" : "error";
+      detail = String(e?.message || e).slice(0, 200);
+    }
   }
+  return { raw: null, model, err, attempts, detail };
 }
 
 function coerce(v, p) {
@@ -577,6 +596,15 @@ export class IncidentRun {
     this.chain = Promise.resolve();
   }
 
+  async note(entry) {
+    const e = { t: new Date().toISOString(), ...entry };
+    console.log("GA5_EVENT", JSON.stringify(e));
+    try {
+      const idx = this.env.RUNS.get(this.env.RUNS.idFromName(INDEX_NAME));
+      await idx.fetch("https://run/log", { method: "POST", body: JSON.stringify(e) });
+    } catch { /* journaling must never break a request */ }
+  }
+
   lock(fn) {
     const p = this.chain.then(fn, fn);
     this.chain = p.catch(() => {});
@@ -586,16 +614,29 @@ export class IncidentRun {
   async fetch(request) {
     try {
       const path = new URL(request.url).pathname;
+      if (path === "/log") {
+        const key = "e:" + String(Date.now()).padStart(15, "0") + ":" + hexid(4);
+        await this.ctx.storage.put(key, JSON.parse(await request.text()));
+        return json({ ok: true });
+      }
+      if (path === "/recent") {
+        const limit = Math.min(200, parseInt(new URL(request.url).searchParams.get("limit") || "60", 10) || 60);
+        const m = await this.ctx.storage.list({ prefix: "e:", reverse: true, limit });
+        return json({ events: [...m.values()] });
+      }
       if (path === "/get") {
         const cur = await this.ctx.storage.get("current");
+        await this.note({ kind: "get", runId: request.headers.get("x-ga5-run"), found: !!cur, status: cur?.status });
         return cur ? json(cur) : err(404, "unknown run");
       }
+      this.lastRunHeader = request.headers.get("x-ga5-run");
       const text = await request.text();
       if (path === "/create") return await this.lock(() => this.create(request, text));
       if (path === "/receipt") return await this.lock(() => this.receipt(text));
       return err(404, "not found");
     } catch (e) {
       console.error("GA5_ERROR", e && e.stack ? e.stack : String(e));
+      await this.note({ kind: "error", where: "do", message: String(e?.message || e).slice(0, 300) });
       return err(500, "internal error");
     }
   }
@@ -606,20 +647,29 @@ export class IncidentRun {
     const h = await sha(canon(b));
     const existing = await this.ctx.storage.get("state");
     if (existing) {
-      if (existing.reqHash === h) return json(await this.ctx.storage.get("create"));
+      if (existing.reqHash === h) {
+        await this.note({ kind: "create-replay", runId: b.runId });
+        return json(await this.ctx.storage.get("create"));
+      }
+      await this.note({ kind: "create-conflict", runId: b.runId });
       return err(409, "runId already exists with different content");
     }
+    const t0 = Date.now();
 
     const inc = b.incident, pol = b.policy;
     const trace = incomingTrace(request.headers, b);
     const secs = new Set();
     collectSecrets(b.sensitive, secs);
     const transcript = redact(inc.transcript, secs);
-    const knownIds = dedupe([...transcript.matchAll(/^\s*\[([^\]\s]+)\]/gm)].map((m) => m[1]));
+    const knownIds = dedupe([
+      ...[...transcript.matchAll(/^\s*\[([^\]\s]+)\]/gm)].map((m) => m[1]),
+      ...[...transcript.matchAll(/\[([A-Za-z0-9_.:\-]{3,})\]/g)].map((m) => m[1]),
+    ]);
 
     const tAgent = nowNs();
     const tChat = nowNs();
-    const [raw, model, modelErr] = await planWithModel(this.env, buildMessages(b, transcript, secs));
+    const plan0 = await planWithModel(this.env, buildMessages(b, transcript, secs));
+    const raw = plan0.raw, model = plan0.model, modelErr = plan0.err;
     const tChatEnd = nowNs();
     const plan = normalizePlan(raw, b, knownIds, secs);
     for (const e of [plan.effect, plan.pageEffect]) if (e) e.digest = await sha(canon(e.arguments));
@@ -645,29 +695,68 @@ export class IncidentRun {
     st.trace.serverEnd = nowNs();
     const resp = advance(st, fresh);
     await this.ctx.storage.put({ state: st, create: resp, current: resp });
+    await this.note({
+      kind: "create", runId: b.runId, ms: Date.now() - t0, incidentId: inc.incidentId, service: inc.service,
+      model, modelErr, modelAttempts: plan0.attempts, modelDetail: plan0.detail,
+      transcriptChars: transcript.length, evidenceIdsFound: knownIds.length,
+      allowedRootCauses: inc.allowedRootCauses, tools: b.toolCatalog.map((t) => t.name),
+      effectTools: asList(pol.effectTools), approvalRequiredFor: asList(pol.approvalRequiredFor),
+      maximumDiagnostics: pol.maximumDiagnostics, incomingTrace: !!trace,
+      diagnosis: plan.diagnosis,
+      dispatches: fresh.map((d) => ({ tool: d.toolName, args: d.arguments, evidence: d.evidence })),
+      plannedEffect: plan.effect, pageEffect: plan.pageEffect,
+    });
     return json(resp);
   }
 
   async receipt(text) {
     let body;
     try { body = JSON.parse(text); } catch { return err(400, "invalid JSON"); }
-    if (!isObj(body)) return err(400, "body must be a JSON object");
-    if (typeof body.receiptId !== "string" || !body.receiptId.trim()) return err(422, "invalid receiptId");
+    const runId = this.lastRunHeader;
+    if (!isObj(body)) { await this.note({ kind: "receipt-reject", runId, code: 400, reason: "not an object" }); return err(400, "body must be a JSON object"); }
+    if (typeof body.receiptId !== "string" || !body.receiptId.trim()) {
+      await this.note({ kind: "receipt-reject", runId, code: 422, reason: "invalid receiptId", keys: Object.keys(body) });
+      return err(422, "invalid receiptId");
+    }
     const st = await this.ctx.storage.get("state");
-    if (!st) return err(404, "unknown run");
+    if (!st) { await this.note({ kind: "receipt-reject", runId, code: 404, reason: "unknown run" }); return err(404, "unknown run"); }
     const h = await sha(canon(body));
     const key = "rcpt:" + body.receiptId;
     const prev = await this.ctx.storage.get(key);
-    if (prev) return prev.hash === h ? json(prev.response) : err(409, "receiptId already used with different content");
+    if (prev) {
+      await this.note({ kind: prev.hash === h ? "receipt-replay" : "receipt-conflict", runId: st.runId, receiptId: body.receiptId });
+      return prev.hash === h ? json(prev.response) : err(409, "receiptId already used with different content");
+    }
     const next = structuredClone(st);
     let resp;
     try {
       resp = applyReceipt(next, body);
     } catch (e) {
-      if (e instanceof Invalid) return err(e.code, e.message);
+      if (e instanceof Invalid) {
+        await this.note({
+          kind: "receipt-reject", runId: st.runId, receiptId: body.receiptId, code: e.code, reason: e.message,
+          runStatus: st.status, keys: Object.keys(body),
+          sentOutcomes: asList(body.outcomes).map((o) => (isObj(o)
+            ? { actionId: o.actionId, callId: o.callId, attempt: o.attempt, status: o.status, keys: Object.keys(o) } : typeof o)),
+          sentApprovals: asList(body.approvals).map((a) => (isObj(a) ? { approvalId: a.approvalId, decision: a.decision, keys: Object.keys(a) } : typeof a)),
+          pending: st.pending, pendingApproval: st.approval?.state === "pending" ? st.approval.approvalId : null,
+        });
+        return err(e.code, e.message);
+      }
       throw e;
     }
     await this.ctx.storage.put({ state: next, current: resp, [key]: { hash: h, response: resp } });
+    await this.note({
+      kind: "receipt", runId: st.runId, receiptId: body.receiptId, runStatus: resp.status,
+      outcomes: asList(body.outcomes).map((o) => ({
+        tool: next.actions[o.actionId]?.toolName, attempt: o.attempt, status: o.status,
+        resultClass: o.resultClass, errorType: o.errorType,
+      })),
+      approvals: asList(body.approvals).map((a) => a.decision),
+      newDispatches: resp.dispatches.map((d) => `${d.toolName}#${d.attempt}`),
+      approvalRequested: resp.approvals.map((a) => a.toolName),
+      chosenEffect: resp.chosenEffect, suppressed: resp.suppressed,
+    });
     return json(resp);
   }
 }
@@ -677,7 +766,7 @@ export class IncidentRun {
 // ---------------------------------------------------------------------------
 function forward(env, runId, path, request, body) {
   const stub = env.RUNS.get(env.RUNS.idFromName(runId));
-  const headers = new Headers({ "content-type": "application/json", "x-ga5-start": nowNs() });
+  const headers = new Headers({ "content-type": "application/json", "x-ga5-start": nowNs(), "x-ga5-run": runId });
   for (const h of ["traceparent", "tracestate"]) {
     const v = request.headers.get(h);
     if (v) headers.set(h, v);
@@ -695,13 +784,28 @@ export default {
 
       if (path === "/" && (m === "GET" || m === "HEAD")) return json({ ok: true, profile: PROFILE });
 
+      if (path === "/v2/debug/recent" && m === "GET") {
+        const stub = env.RUNS.get(env.RUNS.idFromName(INDEX_NAME));
+        return await stub.fetch("https://run/recent" + url.search);
+      }
+
       if (path === "/v2/incidents") {
         if (m !== "POST") return err(405, "method not allowed");
         const text = await request.text();
         if (text.length > 5_000_000) return err(413, "body too large");
         let body;
         try { body = JSON.parse(text); } catch { return err(400, "invalid JSON"); }
-        try { validateCreate(body); } catch (e) { return err(e.code || 400, e.message); }
+        try { validateCreate(body); } catch (e) {
+          try {
+            const stub = env.RUNS.get(env.RUNS.idFromName(INDEX_NAME));
+            await stub.fetch("https://run/log", { method: "POST", body: JSON.stringify({
+              t: new Date().toISOString(), kind: "create-reject", code: e.code || 400, reason: e.message,
+              runId: isObj(body) && typeof body.runId === "string" ? body.runId : null,
+              keys: isObj(body) ? Object.keys(body) : typeof body,
+            }) });
+          } catch { /* ignore */ }
+          return err(e.code || 400, e.message);
+        }
         return await forward(env, body.runId, "/create", request, text);
       }
 
