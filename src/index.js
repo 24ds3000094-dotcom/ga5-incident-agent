@@ -594,7 +594,8 @@ export class IncidentRun {
       if (path === "/create") return await this.lock(() => this.create(request, text));
       if (path === "/receipt") return await this.lock(() => this.receipt(text));
       return err(404, "not found");
-    } catch {
+    } catch (e) {
+      console.error("GA5_ERROR", e && e.stack ? e.stack : String(e));
       return err(500, "internal error");
     }
   }
@@ -718,7 +719,8 @@ export default {
         return await forward(env, decodeURIComponent(mg[1]), "/get", request);
       }
       return err(404, "not found");
-    } catch {
+    } catch (e) {
+      console.error("GA5_ERROR", e && e.stack ? e.stack : String(e));
       return err(500, "internal error");
     }
   },
