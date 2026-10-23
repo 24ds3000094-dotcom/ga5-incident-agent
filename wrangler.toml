@@ -1,0 +1,22 @@
+name = "ga5-incident-agent"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+# Free model fallback (used only when the LLM_API_KEY secret is NOT set)
+[ai]
+binding = "AI"
+
+# One SQLite-backed Durable Object per runId (works on the free plan)
+[[durable_objects.bindings]]
+name = "RUNS"
+class_name = "RunStore"
+
+[[migrations]]
+tag = "ga5-v1"
+new_sqlite_classes = ["RunStore"]
+
+[vars]
+LLM_BASE_URL = "https://aipipe.org/openai/v1"
+LLM_MODEL = "gpt-4.1-mini"
+# LLM_API_KEY is a SECRET: set it in the dashboard (Settings > Variables and Secrets), never here.
